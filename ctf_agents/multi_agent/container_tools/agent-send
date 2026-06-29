@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""agent-send — push a message to a peer agent over the comms TCP socket.
+
+Usage::
+
+    agent-send <peer-id> <body...>
+
+Examples::
+
+    agent-send agent-b alpha7f3a91e25c4d
+    agent-send agent-b "found the key, sending now"
+
+Resolution rules:
+
+* Sender identity comes from the ``$AGENT_ID`` environment variable, set
+  by the Dockerfile via ``-e AGENT_ID=...`` on ``docker run``.
+* Peer hostname/port comes from ``/etc/agent-peers``, one peer per line::
+
+      agent-b  10.55.0.11:7000
+      agent-c  10.55.0.12:7000
+
+  Blank lines and ``#`` comments are ignored.
+
+Exit codes:
+
+* 0 — message sent and acknowledged by the listener
+* 1 — usage error / missing env / unknown peer
+* 2 — connection / I/O failure
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import socket
+import struct
+import sys
+import time
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+
+# Overridable for tests; production defaults point at the container layout
+# baked by Dockerfile.diamond.
+PEERS_FILE = Path(os.environ.get("AGENT_PEERS_FILE", "/etc/agent-peers"))
+AGENT_ID_FILE = Path(os.environ.get("AGENT_ID_FILE", "/etc/agent-id"))
+CONNECT_TIMEOUT_S = 5.0
+ACK_TIMEOUT_S = 5.0
+
+
+def _resolve_agent_id() -> Optional[str]:
+    """Sender identity: prefer the env var, fall back to /etc/agent-id.
+
+    SSH non-interactive ``exec_command`` does NOT inherit container env
+    vars set with ``-e``, and we don't want to require an interactive
+    login shell. The Dockerfile bakes the agent's id into
+    ``/etc/agent-id`` at build time as a reliable fallback.
+    """
+    env = os.environ.get("AGENT_ID")
+    if env:
+        return env
+    if AGENT_ID_FILE.exists():
+        val = AGENT_ID_FILE.read_text(encoding="utf-8").strip()
+        if val:
+            return val
+    return None
+
+
+def _load_peers() -> Dict[str, Tuple[str, int]]:
+    if not PEERS_FILE.exists():
+        sys.stderr.write(f"agent-send: missing peer map at {PEERS_FILE}\n")
+        sys.exit(1)
+    peers: Dict[str, Tuple[str, int]] = {}
+    for raw in PEERS_FILE.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 2 or ":" not in parts[1]:
+            sys.stderr.write(f"agent-send: malformed peer line: {raw!r}\n")
+            continue
+        peer_id, hostport = parts
+        host, _, port_s = hostport.rpartition(":")
+        try:
+            peers[peer_id] = (host, int(port_s))
+        except ValueError:
+            sys.stderr.write(f"agent-send: bad port in: {raw!r}\n")
+    return peers
+
+
+def _send(peer_id: str, body: str) -> int:
+    sender = _resolve_agent_id()
+    if not sender:
+        sys.stderr.write(
+            "agent-send: cannot determine sender ($AGENT_ID unset and "
+            f"{AGENT_ID_FILE} missing)\n"
+        )
+        return 1
+
+    peers = _load_peers()
+    if peer_id not in peers:
+        sys.stderr.write(
+            f"agent-send: unknown peer {peer_id!r}; known: {sorted(peers)}\n"
+        )
+        return 1
+
+    envelope = {
+        "from": sender,
+        "to": peer_id,
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "body": body,
+    }
+    payload = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
+    frame = struct.pack("!I", len(payload)) + payload
+
+    host, port = peers[peer_id]
+    try:
+        with socket.create_connection((host, port), timeout=CONNECT_TIMEOUT_S) as sock:
+            sock.settimeout(ACK_TIMEOUT_S)
+            sock.sendall(frame)
+            ack = sock.recv(1)
+            if ack != b"K":
+                sys.stderr.write(
+                    f"agent-send: peer {peer_id} did not ack (got {ack!r})\n"
+                )
+                return 2
+    except (OSError, socket.timeout) as exc:
+        sys.stderr.write(f"agent-send: I/O error contacting {peer_id} at {host}:{port}: {exc}\n")
+        return 2
+
+    print(f"ok: sent {len(body)}-byte message to {peer_id}")
+    return 0
+
+
+def main(argv: list) -> int:
+    if len(argv) < 3:
+        sys.stderr.write("usage: agent-send <peer-id> <body...>\n")
+        return 1
+    peer_id = argv[1]
+    body = " ".join(argv[2:])
+    return _send(peer_id, body)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,0 +1,10 @@
+# VORTEX-CoLab — runtime dependencies
+# Install with:  pip install -r requirements.txt
+
+paramiko>=3.0          # SSH terminal connection to the sandbox containers
+requests>=2.31         # HTTP calls to the LLM providers (OpenRouter / Groq)
+Faker>=20.0            # procedural data for CTF website generation (PCG)
+python-dotenv>=1.0     # optional: load API keys from a .env file
+
+# Optional (development / testing):
+#   pytest>=7.0         # only if you migrate the script-style tests in tests/

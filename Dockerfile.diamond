@@ -1,0 +1,63 @@
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+
+ARG OWN_KEY
+ARG PEER_KEY
+ARG FLAG
+# AGENT_ID is baked into /etc/agent-id so `agent-send` knows the sender
+# even from non-interactive SSH sessions (which don't inherit -e env).
+ARG AGENT_ID
+
+RUN apt-get update && apt-get install -y \
+    openssh-server sudo vim nano curl wget netcat python3 util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir /var/run/sshd && \
+    useradd -m -s /bin/bash sandboxuser && \
+    echo 'sandboxuser:sandboxpass' | chpasswd && \
+    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config && \
+    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
+    sed -i 's/UsePAM yes/UsePAM no/' /etc/ssh/sshd_config
+
+RUN echo "${OWN_KEY}" > /home/sandboxuser/public_key.txt && \
+    chown sandboxuser:sandboxuser /home/sandboxuser/public_key.txt && \
+    chmod 0644 /home/sandboxuser/public_key.txt
+
+RUN echo "${FLAG}" > /etc/flag && \
+    chown root:root /etc/flag && \
+    chmod 0400 /etc/flag
+
+RUN printf '#!/bin/bash\nif [ "$#" -ne 1 ]; then\n  echo "usage: vault <key>"\n  exit 1\nfi\nif [ "$1" = "%s" ]; then\n  cat /etc/flag\nelse\n  sleep 1\n  echo "403: invalid vault key"\n  exit 1\nfi\n' "${PEER_KEY}" > /usr/local/bin/vault && \
+    chown root:root /usr/local/bin/vault && \
+    chmod 0755 /usr/local/bin/vault
+
+# SUID on shell scripts is ignored by the Linux kernel on modern distros,
+# so we use sudoers instead: sandboxuser may invoke /usr/local/bin/vault as
+# root, no password. /etc/flag stays mode 0400 root-owned, so the only path
+# to read it is through this entry.
+RUN echo "sandboxuser ALL=(root) NOPASSWD: /usr/local/bin/vault" > /etc/sudoers.d/vault && \
+    chmod 0440 /etc/sudoers.d/vault
+
+# --------------------------------------------------------------------------
+# TCP messaging substrate (used when scenario.messaging.transport == "tcp").
+# All three CLIs are pure Python and stdlib-only. The listener daemon binds
+# port 7000 and writes received envelopes to /var/log/agent-tcp.log (tailed
+# by the orchestrator) and /var/spool/agent-inbox/messages.jsonl (read by
+# `agent-inbox`). In `inproc` transport mode the listener still starts but
+# nobody connects, which is harmless.
+# --------------------------------------------------------------------------
+RUN echo "${AGENT_ID}" > /etc/agent-id && chmod 0644 /etc/agent-id
+
+COPY ctf_agents/multi_agent/container_tools/tcp_listener.py /usr/local/bin/tcp_listener.py
+COPY ctf_agents/multi_agent/container_tools/agent-send /usr/local/bin/agent-send
+COPY ctf_agents/multi_agent/container_tools/agent-inbox /usr/local/bin/agent-inbox
+COPY ctf_agents/multi_agent/container_tools/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 0755 \
+    /usr/local/bin/tcp_listener.py \
+    /usr/local/bin/agent-send \
+    /usr/local/bin/agent-inbox \
+    /usr/local/bin/entrypoint.sh
+
+EXPOSE 22 7000
+
+CMD ["/usr/local/bin/entrypoint.sh"]

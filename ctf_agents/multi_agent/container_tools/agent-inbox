@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""agent-inbox — read messages received by this container.
+
+Usage::
+
+    agent-inbox                      # pretty-print every message ever received
+    agent-inbox --since-last         # only messages received since last call
+    agent-inbox --latest             # only the most recent message
+    agent-inbox --latest --raw       # just the body of the most recent message
+                                       (useful for `vault $(agent-inbox --latest --raw)`)
+    agent-inbox --json               # machine-readable: full envelopes, one JSON per line
+
+``--since-last`` persists a byte-offset cursor under
+``/var/spool/agent-inbox/cursor`` so repeated calls only show new traffic.
+
+Exit codes:
+
+* 0 — at least one message returned (or zero if requested)
+* 0 — no messages but request was well-formed
+* 1 — bad flags / I/O error
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Dict, Iterable, List, Tuple
+
+
+INBOX_DIR = Path(os.environ.get("AGENT_INBOX_DIR", "/var/spool/agent-inbox"))
+INBOX_LOG = INBOX_DIR / "messages.jsonl"
+CURSOR = INBOX_DIR / "cursor"
+
+
+def _read_lines(since_offset: int) -> Tuple[List[str], int]:
+    """Return (lines, new_offset) starting at byte offset ``since_offset``."""
+    if not INBOX_LOG.exists():
+        return [], since_offset
+    with INBOX_LOG.open("rb") as f:
+        f.seek(since_offset)
+        raw = f.read()
+        new_offset = f.tell()
+    text = raw.decode("utf-8", errors="replace")
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    return lines, new_offset
+
+
+def _load_cursor() -> int:
+    if not CURSOR.exists():
+        return 0
+    try:
+        return int(CURSOR.read_text(encoding="utf-8").strip() or "0")
+    except ValueError:
+        return 0
+
+
+def _save_cursor(offset: int) -> None:
+    INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    CURSOR.write_text(str(offset), encoding="utf-8")
+
+
+def _parse(lines: Iterable[str]) -> List[Dict]:
+    out: List[Dict] = []
+    for ln in lines:
+        try:
+            out.append(json.loads(ln))
+        except json.JSONDecodeError:
+            sys.stderr.write(f"agent-inbox: skipping malformed line: {ln!r}\n")
+    return out
+
+
+def _render_pretty(messages: List[Dict]) -> str:
+    if not messages:
+        return "(inbox empty)"
+    rows = []
+    for m in messages:
+        rows.append(
+            f"[{m.get('ts', '?')}] {m.get('from', '?')} -> {m.get('to', '?')}: "
+            f"{m.get('body', '')}"
+        )
+    return "\n".join(rows)
+
+
+def main(argv: list) -> int:
+    p = argparse.ArgumentParser(
+        prog="agent-inbox",
+        description="Read messages from this agent's TCP inbox.",
+    )
+    p.add_argument("--since-last", action="store_true",
+                   help="only show messages received since the last call (uses cursor)")
+    p.add_argument("--latest", action="store_true",
+                   help="only show the most recently received message")
+    p.add_argument("--raw", action="store_true",
+                   help="print only message bodies (no envelope formatting)")
+    p.add_argument("--json", action="store_true",
+                   help="print full envelopes as JSON lines (overrides --raw)")
+    args = p.parse_args(argv[1:])
+
+    start_offset = _load_cursor() if args.since_last else 0
+    try:
+        lines, new_offset = _read_lines(start_offset)
+    except OSError as exc:
+        sys.stderr.write(f"agent-inbox: failed to read {INBOX_LOG}: {exc}\n")
+        return 1
+
+    messages = _parse(lines)
+    if args.latest:
+        messages = messages[-1:] if messages else []
+
+    if args.json:
+        for m in messages:
+            print(json.dumps(m, ensure_ascii=False))
+    elif args.raw:
+        for m in messages:
+            print(m.get("body", ""))
+    else:
+        print(_render_pretty(messages))
+
+    # Only advance the cursor once we've successfully printed.
+    if args.since_last:
+        _save_cursor(new_offset)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
